@@ -1,0 +1,33 @@
+MacTab — free prebuilt installation (macOS 14 or later)
+
+Download the release from the author and extract the ZIP. No Xcode is needed.
+This release is not notarized by Apple. In Terminal, enter the extracted MacTab
+folder and run:
+
+    ./install.sh --allow-unnotarized
+
+This copies MacTab.app to ~/Applications, applies a local ad-hoc signature, and
+removes download quarantine from this app only. It does not change Gatekeeper
+globally. Run this command only for a release you trust. Without the flag, the
+installer preserves quarantine; macOS may require Privacy & Security → Open
+Anyway before it will open the app.
+
+After installing, enable MacTab in System Settings → Privacy & Security →
+Accessibility. For window previews, also enable Screen & System Audio Recording.
+Relaunch MacTab and click Check permissions. These permissions are granted by
+you in macOS; the installer does not grant them.
+
+Quit MacTab before installing an update. The previous app is saved in a ZIP
+inside ~/Applications/.MacTab-backups. Settings remain in place. With ad-hoc
+signing, a new release may need fresh privacy grants even when the old entries
+still look enabled. Remove and re-add MacTab if Check permissions reports denied.
+
+If you already have your own valid local Code Signing certificate, reuse it:
+
+    ./install.sh --allow-unnotarized --identity 'Your Signing Identity'
+
+That keeps your local signing identity consistent across releases. No Apple
+Developer Program membership is needed for this personal signing workflow.
+
+Run ./install.sh --help for other options. Removing ~/Applications/MacTab.app
+uninstalls the app; permission entries and preferences can be removed separately.
