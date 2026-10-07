@@ -42,6 +42,13 @@ public struct Selection: Equatable {
         windowIndex = min(max(0, preferredIndex), max(0, count - 1))
     }
 
+    /// Metadata refreshes may reorder or remove windows while the user is navigating.
+    public mutating func refreshWindows<Identity: Equatable>(previous: [Identity], updated: [Identity]) {
+        let selected = previous.indices.contains(windowIndex) ? previous[windowIndex] : nil
+        let index = selected.flatMap { updated.firstIndex(of: $0) } ?? windowIndex
+        setWindows(count: updated.count, preferredIndex: index)
+    }
+
     public mutating func moveWindow(_ offset: Int) {
         guard isActive, isExpanded else { return }
         windowIndex = Self.wrapped(windowIndex + offset, count: windowCount)

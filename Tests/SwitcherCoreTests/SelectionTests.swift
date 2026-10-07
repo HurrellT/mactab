@@ -2,6 +2,40 @@ import XCTest
 @testable import SwitcherCore
 
 final class SelectionTests: XCTestCase {
+    func testRefreshKeepsTheNavigatedWindowWhenDiscoveryReordersResults() {
+        var state = Selection()
+        state.beginWindows()
+        state.setWindows(count: 3, preferredIndex: 0)
+        state.moveWindow(1) // First Cmd+` selects ID 20, before fresh discovery completes.
+        state.moveWindow(1) // A further press selects ID 30.
+        state.refreshWindows(previous: [10, 20, 30], updated: [30, 10, 40, 20])
+        XCTAssertEqual(state.windowIndex, 0)
+        XCTAssertEqual(state.windowCount, 4)
+        state.moveWindow(-1)
+        XCTAssertEqual(state.windowIndex, 3)
+    }
+
+    func testRefreshKeepsAQuickReleaseTargetByIdentity() {
+        var state = Selection()
+        state.beginWindows()
+        state.setWindows(count: 3, preferredIndex: 1)
+        state.moveWindow(1)
+        state.refreshWindows(previous: [10, 20, 30], updated: [20, 30, 40])
+        XCTAssertEqual(state.windowIndex, 1)
+        XCTAssertEqual([20, 30, 40][state.windowIndex], 30)
+    }
+
+    func testRefreshHandlesTheSelectedWindowClosingAndAnEmptyApp() {
+        var state = Selection()
+        state.beginWindows()
+        state.setWindows(count: 3, preferredIndex: 2)
+        state.refreshWindows(previous: [10, 20, 30], updated: [10, 20])
+        XCTAssertEqual(state.windowIndex, 1)
+        state.refreshWindows(previous: [10, 20], updated: [Int]())
+        XCTAssertEqual(state.windowCount, 0)
+        XCTAssertEqual(state.windowIndex, 0)
+    }
+
     func testFirstDirectShortcutAdvancesRelativeToFocusedWindow() {
         // Enumeration may complete after Command is released. Its queued first
         // press must still advance, including wraparound and reverse switching.

@@ -13,6 +13,7 @@ final class SwitcherController {
     private var windows: [WindowItem] = []
     private var loadedPID: pid_t?
     private var loading = false
+    private var refreshingWindows = false
     private var generation = 0
     private var visiblePreviews: [Int] = []
     private var pendingWindowSteps = 0
@@ -117,33 +118,46 @@ final class SwitcherController {
         }
         guard !loading else { return }
         loading = true
+        refreshingWindows = true
         let token = generation
         panel.expand(app: app, windows: [], selected: 0, remembered: nil, loading: true)
         windowService.windows(for: app.pid, includeMinimized: preferences.includeMinimized,
                               remember: preferences.rememberWindows, allSpaces: preferences.allSpaces,
-                              startingAtFocusedWindow: selection.isWindowOnly) { [weak self] windows, preferred in
+                              startingAtFocusedWindow: selection.isWindowOnly) { [weak self] incoming, preferred, isFinal in
             guard let self else { return }
             // Honor a release during enumeration, including queued window navigation.
             if let pending = pendingCommit, pending.token == token {
+                guard isFinal else { return }
                 pendingCommit = nil
                 var target = Selection()
                 target.begin(appCount: 1)
                 target.expand()
-                target.setWindows(count: windows.count, preferredIndex: preferred)
+                target.setWindows(count: incoming.count, preferredIndex: preferred)
                 target.moveWindow(pending.steps)
-                let window = windows.indices.contains(target.windowIndex) ? windows[target.windowIndex] : nil
+                let window = incoming.indices.contains(target.windowIndex) ? incoming[target.windowIndex] : nil
                 activate(window, application: pending.application, remember: pending.remember)
                 return
             }
             guard selection.isActive, generation == token,
                   apps[selection.appIndex].pid == app.pid else { return }
-            self.windows = windows
+            if loadedPID == app.pid {
+                // Keep the displayed order and selected identity stable during refresh.
+                let refreshed = windows.compactMap { old in incoming.first { $0.identity == old.identity } } +
+                    incoming.filter { item in !self.windows.contains { $0.identity == item.identity } }
+                selection.refreshWindows(previous: windows.map(\.identity), updated: refreshed.map(\.identity))
+                windows = refreshed
+            } else {
+                windows = incoming
+                selection.setWindows(count: incoming.count, preferredIndex: preferred)
+                selection.moveWindow(pendingWindowSteps)
+                pendingWindowSteps = 0
+            }
             loading = false
+            refreshingWindows = !isFinal
             loadedPID = app.pid
-            selection.setWindows(count: windows.count, preferredIndex: preferred)
-            selection.moveWindow(pendingWindowSteps)
-            pendingWindowSteps = 0
-            if selection.isExpanded { renderWindows(remembered: preferences.rememberWindows ? preferred : nil) }
+            let remembered = incoming.indices.contains(preferred) ?
+                windows.firstIndex { $0.identity == incoming[preferred].identity } : nil
+            if selection.isExpanded { renderWindows(remembered: preferences.rememberWindows ? remembered : nil) }
         }
     }
 
@@ -162,17 +176,25 @@ final class SwitcherController {
     }
 
     private func refreshPreviews() {
-        guard preferences.showPreviews, selection.isExpanded, !loading else { return }
+        // A cached pass must not capture the same previews twice. Wait for fresh metadata.
+        guard preferences.showPreviews, selection.isExpanded, !loading, !refreshingWindows else { return }
         let indices = panel.visibleWindowIndices()
         guard indices != visiblePreviews else { return }
         visiblePreviews = indices
-        panel.clearPreviews()
+        panel.clearPreviews(except: indices)
+        let missing = indices.filter { !panel.hasPreview(at: $0) }
+        guard !missing.isEmpty else {
+            previews.cancel()
+            panel.setPreviewStatus(nil)
+            return
+        }
         let token = generation
-        previews.load(pid: apps[selection.appIndex].pid, windows: windows, indices: indices, status: { [weak self] message in
+        previews.load(pid: apps[selection.appIndex].pid, windows: windows, indices: missing, status: { [weak self] message in
             guard let self, selection.isActive, selection.isExpanded, generation == token else { return }
             panel.setPreviewStatus(message)
         }) { [weak self] index, image in
-            guard let self, selection.isActive, selection.isExpanded, generation == token else { return }
+            guard let self, selection.isActive, selection.isExpanded, generation == token,
+                  visiblePreviews.contains(index) else { return }
             panel.setPreview(image, at: index)
         }
     }
@@ -182,6 +204,7 @@ final class SwitcherController {
         windows.removeAll()
         loadedPID = nil
         loading = false
+        refreshingWindows = false
         pendingWindowSteps = 0
         visiblePreviews = []
         previews.cancel()

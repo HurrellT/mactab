@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import OSLog
 import SwitcherCore
 
 struct WindowItem {
@@ -11,6 +12,37 @@ struct WindowItem {
     var windowID: CGWindowID? = nil
     var isOnCurrentSpace: Bool = true
     var menuItem: AXUIElement? = nil
+
+    var identity: WindowIdentity {
+        if let windowID { return .server(windowID) }
+        if let element = element ?? menuItem { return .accessibility(element) }
+        return .fallback(title, frame)
+    }
+}
+
+enum WindowIdentity: Equatable {
+    case server(CGWindowID)
+    case accessibility(AXUIElement)
+    case fallback(String, CGRect)
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        switch (lhs, rhs) {
+        case (.server(let a), .server(let b)): return a == b
+        case (.accessibility(let a), .accessibility(let b)): return CFEqual(a, b)
+        case (.fallback(let at, let af), .fallback(let bt, let bf)): return at == bt && af == bf
+        default: return false
+        }
+    }
+}
+
+private struct WindowSnapshotKey: Equatable {
+    let pid: pid_t
+    let includeMinimized: Bool
+    let allSpaces: Bool
+    let displays: [CGRect]
+    let inventory: Set<CGWindowID>
+    let published: Set<CGWindowID>
+    let minimized: Set<CGWindowID>
 }
 
 private struct ServerWindow {
@@ -26,8 +58,17 @@ final class WindowService {
     private let crossSpace = CrossSpaceAccessibility()
     private var remembered: [pid_t: AXUIElement] = [:]
     private var cached: [pid_t: [CGWindowID: AXUIElement]] = [:]
+    private var snapshots = WindowSnapshotCache<WindowSnapshotKey, WindowItem>()
+    private var recoveryAttempt: (pid: pid_t, ids: Set<CGWindowID>, time: Double)?
+    private let timings = CommandLine.arguments.contains("--window-timing")
+    private let logger = Logger(subsystem: "com.tlh.mactab", category: "window-discovery")
     private var observer: AXObserver?
     private var observedPID: pid_t?
+
+    init() {
+        // Application-root timeouts do not apply to its child window/menu elements.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.15)
+    }
 
     static func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
         var value: CFTypeRef?
@@ -60,14 +101,15 @@ final class WindowService {
         AXObserverAddNotification(newObserver, app, kAXFocusedWindowChangedNotification as CFString,
                                   Unmanaged.passUnretained(self).toOpaque())
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(newObserver), .commonModes)
-        recordFocused(pid)
+        recordFocused(pid, includeWindows: true)
     }
 
-    func recordFocused(_ pid: pid_t) {
+    func recordFocused(_ pid: pid_t, includeWindows: Bool = false) {
         queue.async { [self] in
             let app = application(pid)
             // References acquired on a Space remain usable after leaving it, notably in Chromium.
-            var elements = Self.attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            // Seed other-Space references on activation, not on every focus change.
+            var elements = includeWindows ? Self.attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? [] : []
             if let value = Self.attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() {
                 let focused = value as! AXUIElement
                 remembered[pid] = focused
@@ -84,6 +126,8 @@ final class WindowService {
             remembered.removeValue(forKey: pid)
             cached.removeValue(forKey: pid)
             crossSpace.forget(pid)
+            if snapshots.key?.pid == pid { snapshots.clear() }
+            if recoveryAttempt?.pid == pid { recoveryAttempt = nil }
         }
         if observedPID == pid {
             if let observer { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes) }
@@ -107,24 +151,84 @@ final class WindowService {
 
     func windows(for pid: pid_t, includeMinimized: Bool, remember: Bool, allSpaces: Bool,
                  startingAtFocusedWindow: Bool = false,
-                 completion: @escaping ([WindowItem], Int) -> Void) {
+                 completion: @escaping ([WindowItem], Int, Bool) -> Void) {
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         let displays = NSScreen.screens.enumerated().map { index, screen in
             (CGRect(x: screen.frame.minX, y: primaryHeight - screen.frame.maxY,
                     width: screen.frame.width, height: screen.frame.height), "Display \(index + 1)")
         }
+        let requestedAt = Self.uptime
         queue.async { [self] in
+            let started = Self.uptime
             let app = application(pid)
             let published = Self.attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
             let inventory = serverWindows(pid)
             let byID = Dictionary(inventory.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             var elements: [CGWindowID: AXUIElement] = [:]
             var publishedIDs = Set<CGWindowID>()
-            for element in published {
-                if let id = crossSpace.windowID(element) {
+            let publishedWindows = published.map { (element: $0, id: crossSpace.windowID($0)) }
+            for (element, id) in publishedWindows {
+                if let id {
                     elements[id] = element
                     publishedIDs.insert(id)
                     cached[pid, default: [:]][id] = element
+                }
+            }
+            var minimizedIDs = Set<CGWindowID>()
+            if !includeMinimized {
+                var candidates = elements
+                if allSpaces {
+                    for (id, element) in cached[pid, default: [:]] where candidates[id] == nil && byID[id] != nil {
+                        candidates[id] = element
+                    }
+                }
+                for (id, element) in candidates where Self.attribute(element, kAXMinimizedAttribute) as? Bool == true {
+                    minimizedIDs.insert(id)
+                }
+            }
+            // A new/closed window or a current-Space list change needs a fresh list
+            // before applying the first shortcut step, rather than an incomplete cycle.
+            let key = WindowSnapshotKey(pid: pid, includeMinimized: includeMinimized, allSpaces: allSpaces,
+                                        displays: displays.map { $0.0 }, inventory: Set(byID.keys).union(publishedIDs),
+                                        published: allSpaces ? [] : publishedIDs, minimized: minimizedIDs)
+            // Read the real focus before presenting cached cards. A stale remembered
+            // index must never make the first standalone shortcut advance incorrectly.
+            var previous = remember ? remembered[pid] : nil
+            if startingAtFocusedWindow,
+               let value = Self.attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() {
+                previous = (value as! AXUIElement)
+            }
+            let previousID = previous.flatMap { crossSpace.windowID($0) }
+            func preferredIndex(_ items: [WindowItem]) -> Int? {
+                items.firstIndex { item in
+                    if let element = item.element, let previous, CFEqual(element, previous) { return true }
+                    return previousID != nil && item.windowID == previousID
+                }
+            }
+            var cacheHit = false
+            if let snapshot = snapshots.value(for: key, now: started) {
+                let cards = snapshot.compactMap { original -> WindowItem? in
+                    let isPublished = original.windowID.map { publishedIDs.contains($0) } ??
+                        original.element.map { element in published.contains { CFEqual($0, element) } } ?? false
+                    let server = original.windowID.flatMap { byID[$0] }
+                    // Do not display closed cards, or carry visibility across Space changes.
+                    guard server != nil || isPublished else { return nil }
+                    guard WindowVisibility.includes(allSpaces: allSpaces, publishedByAccessibility: isPublished,
+                                                    onScreen: server?.onScreen ?? false, minimized: original.isMinimized,
+                                                    includeMinimized: includeMinimized) else { return nil }
+                    var card = original
+                    card.isOnCurrentSpace = isPublished || (server?.onScreen ?? false)
+                    return card
+                }
+                let preferred = preferredIndex(cards)
+                // Newly focused windows need full discovery before cycling from them.
+                let knownMinimizedState = includeMinimized || !publishedWindows.contains { $0.id == nil }
+                if !cards.isEmpty, knownMinimizedState, !startingAtFocusedWindow || preferred != nil {
+                    cacheHit = true
+                    DispatchQueue.main.async { completion(cards, preferred ?? 0, false) }
+                    if timings {
+                        logger.info("Cached cards: pid=\(pid) count=\(cards.count) first_ms=\((Self.uptime - requestedAt) * 1000)")
+                    }
                 }
             }
             // Retain only IDs that still exist in this process's current inventory.
@@ -132,9 +236,18 @@ final class WindowService {
             if allSpaces {
                 for (id, element) in cached[pid, default: [:]] { elements[id] = element }
                 let missing = Set(byID.keys).subtracting(elements.keys)
-                for (id, element) in crossSpace.recover(pid: pid, ids: missing) {
-                    elements[id] = element
-                    cached[pid, default: [:]][id] = element
+                // An unchanged unresolved inventory should not trigger a 200 ms scan
+                // on every key press. Retry on new IDs or after five seconds, on demand.
+                let retry = recoveryAttempt.map { $0.pid != pid || $0.ids != missing || started - $0.time >= 5 } ?? true
+                if !missing.isEmpty, retry {
+                    let recovered = crossSpace.recover(pid: pid, ids: missing)
+                    recoveryAttempt = (pid, missing.subtracting(recovered.keys), Self.uptime)
+                    for (id, element) in recovered {
+                        elements[id] = element
+                        cached[pid, default: [:]][id] = element
+                    }
+                } else if missing.isEmpty, recoveryAttempt?.pid == pid {
+                    recoveryAttempt = nil
                 }
             }
             let menu = allSpaces && byID.keys.contains(where: { elements[$0] == nil }) ? windowMenuEntries(app) : []
@@ -154,7 +267,7 @@ final class WindowService {
                 }
             }
             // Preserve the app's AX order first, then add other Spaces in WindowServer order.
-            for element in published { append(element, id: crossSpace.windowID(element), published: true) }
+            for (element, id) in publishedWindows { append(element, id: id, published: true) }
             for server in inventory where !publishedIDs.contains(server.id) && allSpaces {
                 if let element = elements[server.id] { append(element, id: server.id, published: false) }
                 else if !rejected.contains(server.id), server.frame.width >= 80, server.frame.height >= 80 {
@@ -186,35 +299,47 @@ final class WindowService {
                                              isOnCurrentSpace: server.onScreen))
                 }
             }
-            // Direct Cmd+` cycles relative to the actual focused window, independently
-            // of the preference for restoring remembered windows during app switching.
-            var previous = remember ? remembered[pid] : nil
-            if startingAtFocusedWindow,
-               let value = Self.attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() {
-                previous = (value as! AXUIElement)
+            let preferred = preferredIndex(result) ?? 0
+            snapshots.store(result, for: key, now: Self.uptime)
+            if timings {
+                // Payload estimate excludes opaque AX objects and allocator overhead.
+                let payload = snapshots.key == key ? result.count * MemoryLayout<WindowItem>.stride +
+                    result.reduce(0) { $0 + $1.title.utf8.count + $1.displayName.utf8.count } : 0
+                logger.info("Window refresh: pid=\(pid) cache_hit=\(cacheHit) count=\(result.count) total_ms=\((Self.uptime - requestedAt) * 1000) metadata_bytes_estimate=\(payload)")
             }
-            let previousID = previous.flatMap { crossSpace.windowID($0) }
-            let preferred = result.firstIndex(where: { item in
-                if let element = item.element, let previous, CFEqual(element, previous) { return true }
-                return previousID != nil && item.windowID == previousID
-            }) ?? 0
-            DispatchQueue.main.async { completion(result, preferred) }
+            DispatchQueue.main.async { completion(result, preferred, true) }
         }
     }
 
+    private static var uptime: Double { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
+
     private func describe(_ element: AXUIElement, id: CGWindowID?, server: ServerWindow?,
                           displays: [(CGRect, String)]) -> WindowItem? {
-        guard Self.attribute(element, kAXRoleAttribute) as? String == kAXWindowRole,
-              Self.attribute(element, kAXSubroleAttribute) as? String != kAXSystemDialogSubrole else { return nil }
-        let minimized = Self.attribute(element, kAXMinimizedAttribute) as? Bool ?? false
-        let title = Self.attribute(element, kAXTitleAttribute) as? String ?? server?.title ?? ""
+        // Recovered roots use a shorter timeout while scanning; metadata gets the
+        // normal timeout once the root is known to belong to a requested window.
+        AXUIElementSetMessagingTimeout(element, 0.15)
+        let names = [kAXRoleAttribute, kAXSubroleAttribute, kAXMinimizedAttribute,
+                     kAXTitleAttribute, kAXPositionAttribute, kAXSizeAttribute]
+        var copied: CFArray?
+        let status = AXUIElementCopyMultipleAttributeValues(element, names as CFArray, [], &copied)
+        let values: [Any]
+        if status == .success, let copied, CFArrayGetCount(copied) == names.count {
+            values = copied as! [Any]
+        } else if status == .notImplemented || status == .attributeUnsupported {
+            // Some custom accessibility implementations only support individual reads.
+            values = names.map { Self.attribute(element, $0) ?? NSNull() }
+        } else { return nil }
+        guard values[0] as? String == kAXWindowRole,
+              values[1] as? String != kAXSystemDialogSubrole else { return nil }
+        let minimized = values[2] as? Bool ?? false
+        let title = values[3] as? String ?? server?.title ?? ""
         var position = server?.frame.origin ?? .zero
         var size = server?.frame.size ?? .zero
-        if let value = Self.attribute(element, kAXPositionAttribute), CFGetTypeID(value) == AXValueGetTypeID() {
-            AXValueGetValue(value as! AXValue, .cgPoint, &position)
+        if CFGetTypeID(values[4] as CFTypeRef) == AXValueGetTypeID() {
+            AXValueGetValue(values[4] as! AXValue, .cgPoint, &position)
         }
-        if let value = Self.attribute(element, kAXSizeAttribute), CFGetTypeID(value) == AXValueGetTypeID() {
-            AXValueGetValue(value as! AXValue, .cgSize, &size)
+        if CFGetTypeID(values[5] as CFTypeRef) == AXValueGetTypeID() {
+            AXValueGetValue(values[5] as! AXValue, .cgSize, &size)
         }
         guard size.width > 1, size.height > 1 else { return nil }
         let frame = CGRect(origin: position, size: size)
@@ -249,11 +374,32 @@ final class WindowService {
         return []
     }
 
-    func focus(_ window: WindowItem?, application app: NSRunningApplication, remember: Bool,
+    func focus(_ requestedWindow: WindowItem?, application app: NSRunningApplication, remember: Bool,
                completion: @escaping (Bool) -> Void) {
         let pid = app.processIdentifier
         queue.async { [self] in
+            guard !app.isTerminated else { DispatchQueue.main.async { completion(false) }; return }
+            var window = requestedWindow
+            // Discovery queued before this activation may have refreshed a cached card.
+            if let key = snapshots.key, key.pid == pid,
+               let current = snapshots.value(for: key, now: Self.uptime), let requestedWindow,
+               let updated = current.first(where: { $0.identity == requestedWindow.identity }) {
+                window = updated
+            }
             var target = window?.element ?? (window == nil && remember ? remembered[pid] : nil)
+            if let element = target {
+                let validRole = Self.attribute(element, kAXRoleAttribute) as? String == kAXWindowRole
+                let validID = window?.windowID.map { crossSpace.windowID(element) == $0 } ?? true
+                if !validRole || !validID {
+                    target = nil
+                    if let id = window?.windowID { cached[pid]?.removeValue(forKey: id) }
+                }
+            }
+            // A closed cached card must not fall through to activating an arbitrary window.
+            if target == nil, let id = window?.windowID, !serverWindows(pid).contains(where: { $0.id == id }) {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
             if target == nil, window?.menuItem == nil, let id = window?.windowID {
                 target = cached[pid]?[id] ?? crossSpace.recover(pid: pid, ids: [id])[id]
             }
@@ -262,11 +408,12 @@ final class WindowService {
                 AXUIElementSetAttributeValue(target, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
             }
             let resolvedTarget = target
+            let resolvedWindow = window
             DispatchQueue.main.async {
                 guard !app.isTerminated else { completion(false); return }
                 app.activate(options: [])
                 self.queue.async {
-                    var raised = window == nil
+                    var raised = resolvedWindow == nil
                     if let target = resolvedTarget {
                         let root = self.application(pid)
                         AXUIElementSetAttributeValue(root, kAXFocusedWindowAttribute as CFString, target)
@@ -277,7 +424,7 @@ final class WindowService {
                             if let id = self.crossSpace.windowID(target) { self.cached[pid, default: [:]][id] = target }
                         } else { self.remembered.removeValue(forKey: pid) }
                     }
-                    if !raised, let window {
+                    if !raised, let window = resolvedWindow {
                         let entries = self.windowMenuEntries(self.application(pid)).filter {
                             WindowTitleMatch.matches(window: window.title, menu: $0.title)
                         }
@@ -288,7 +435,7 @@ final class WindowService {
                             raised = AXUIElementPerformAction(menuItem, kAXPressAction as CFString) == .success
                         }
                     }
-                    DispatchQueue.main.async { completion(raised || window == nil) }
+                    DispatchQueue.main.async { completion(raised || resolvedWindow == nil) }
                 }
             }
         }

@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import SwitcherCore
 
 private final class TileButton: NSButton {
@@ -7,8 +8,32 @@ private final class TileButton: NSButton {
         case window(WindowItem, NSImage, Bool)
     }
     let content: Content
-    var chosen = false { didSet { needsDisplay = true } }
-    var preview: NSImage? { didSet { needsDisplay = true } }
+    // Core Animation stores every CATransition under this key, regardless of the supplied key.
+    private static let previewFadeKey = kCATransition
+    var chosen = false {
+        didSet {
+            guard chosen != oldValue else { return }
+            // Keyboard selection stays immediate, even during a preview transition.
+            layer?.removeAnimation(forKey: Self.previewFadeKey)
+            needsDisplay = true
+        }
+    }
+    var preview: NSImage? {
+        willSet {
+            guard newValue !== preview else { return }
+            layer?.removeAnimation(forKey: Self.previewFadeKey)
+            guard newValue != nil, window?.isVisible == true,
+                  !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+            let fade = CATransition()
+            fade.type = .fade
+            fade.duration = 0.12
+            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            // Core Animation blends the existing backing contents; no redraw timer
+            // or second NSImage is retained by the app for the transition.
+            layer?.add(fade, forKey: Self.previewFadeKey)
+        }
+        didSet { if preview !== oldValue { needsDisplay = true } }
+    }
     override var isFlipped: Bool { false }
     override var allowsVibrancy: Bool { false }
 
@@ -20,7 +45,9 @@ private final class TileButton: NSButton {
         focusRingType = .none
         switch content {
         case .application(let app): setAccessibilityLabel(app.name)
-        case .window(let window, _, _): setAccessibilityLabel("\(window.title), \(window.displayName)")
+        case .window(let window, _, _):
+            wantsLayer = true
+            setAccessibilityLabel("\(window.title), \(window.displayName)")
         }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -232,7 +259,12 @@ final class SwitcherPanel: NSPanel {
         return windowTiles.indices.filter { windowTiles[$0].frame.intersects(visible) }.prefix(6).map { $0 }
     }
 
-    func clearPreviews() { windowTiles.forEach { $0.preview = nil } }
+    func clearPreviews(except indices: [Int] = []) {
+        for (index, tile) in windowTiles.enumerated() where !indices.contains(index) { tile.preview = nil }
+    }
+    func hasPreview(at index: Int) -> Bool {
+        windowTiles.indices.contains(index) && windowTiles[index].preview != nil
+    }
     func setPreviewStatus(_ message: String?) {
         windowHeading.stringValue = headingText + (message.map { " · " + $0 } ?? "")
     }
