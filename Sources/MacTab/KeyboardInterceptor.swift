@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import SwitcherCore
 
 enum SwitcherKey {
     case tab(backwards: Bool), grave(backwards: Bool), left, right, up, down, accept, cancel, release
@@ -9,6 +10,12 @@ final class KeyboardInterceptor {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var suppressed: Set<CGKeyCode> = []
+    private var directKeys: Set<CGKeyCode> = []
+    var bindings: [ShortcutBinding] = []
+    var isRecording = false {
+        didSet { if isRecording { onInterruption() } }
+    }
+    var onShortcut: (ShortcutBinding) -> Void = { _ in }
     var isSwitching: () -> Bool = { false }
     var onKey: (SwitcherKey) -> Void = { _ in }
     var onInterruption: () -> Void = {}
@@ -44,23 +51,39 @@ final class KeyboardInterceptor {
         source = nil
         tap = nil
         suppressed.removeAll()
+        directKeys.removeAll()
     }
 
-    private func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             onInterruption()
             suppressed.removeAll()
+            directKeys.removeAll()
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
         let code = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        if type == .keyUp, suppressed.remove(code) != nil { return nil }
+        if type == .keyUp, suppressed.remove(code) != nil {
+            directKeys.remove(code)
+            return nil
+        }
+        guard !isRecording else { return Unmanaged.passUnretained(event) }
         let command = event.flags.contains(.maskCommand)
         if type == .flagsChanged {
             if isSwitching(), !command { onKey(.release) }
             return Unmanaged.passUnretained(event)
         }
         guard type == .keyDown else { return Unmanaged.passUnretained(event) }
+        // Consume repeats of a captured key even if modifiers changed while held.
+        if event.getIntegerValueField(.keyboardEventAutorepeat) != 0, directKeys.contains(code) { return nil }
+        let chord = KeyboardShortcut(keyCode: code, modifiers: ShortcutModifiers(flags: event.flags))
+        if let binding = bindings.first(where: { $0.shortcut == chord }) {
+            suppressed.insert(code)
+            directKeys.insert(code)
+            guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return nil }
+            onShortcut(binding)
+            return nil
+        }
         let backwards = event.flags.contains(.maskShift)
         let plainCommand = command && !event.flags.contains(.maskControl) && !event.flags.contains(.maskAlternate)
         var key: SwitcherKey?

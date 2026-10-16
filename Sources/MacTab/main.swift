@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let preferences = Preferences()
     private var switcher: SwitcherController!
     private var settings: SettingsWindow!
+    private var shortcutSettings: ShortcutSettingsWindow?
     private var statusItem: NSStatusItem!
     private var enabledItem: NSMenuItem!
     private var enabled = true
@@ -20,10 +21,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         switcher = SwitcherController(preferences: preferences)
         settings = SettingsWindow(preferences: preferences)
+        settings.onOpenShortcuts = { [weak self] in self?.openShortcutSettings() }
         settings.onRefresh = { [weak self] restart in self?.permissionReport(restart: restart) }
         settings.onRelaunch = { [weak self] in self?.relaunch() }
-        settings.onPreferencesChanged = { [weak self] in self?.switcher.cancel() }
+        settings.onPreferencesChanged = { [weak self] in self?.switcher.refreshShortcuts() }
         switcher.onFocusFailure = { NSSound.beep() }
+        switcher.onShortcutError = { [weak self] message in
+            guard let self else { return }
+            let alert = NSAlert()
+            alert.messageText = "Shortcut could not complete"
+            alert.informativeText = message
+            if let window = shortcutSettings?.window, window.isVisible, window.attachedSheet == nil {
+                alert.beginSheetModal(for: window)
+            } else {
+                // Display an actionable error only on failure, never for a successful shortcut.
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
         setupMenu()
         if isDemo {
             showDemo(expanded: CommandLine.arguments.contains("--demo-expanded") || CommandLine.arguments.contains("--demo-windows"))
@@ -120,6 +135,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openSettings() { settings.present() }
+    private func openShortcutSettings() {
+        if shortcutSettings == nil {
+            let controller = ShortcutSettingsWindow(preferences: preferences)
+            controller.onChange = { [weak self] in self?.switcher.refreshShortcuts() }
+            controller.onRecordingChanged = { [weak self] in self?.switcher.keyboard.isRecording = $0 }
+            shortcutSettings = controller
+        }
+        shortcutSettings?.present()
+    }
     @objc private func toggleEnabled() {
         enabled.toggle()
         enabledItem.state = enabled ? .on : .off

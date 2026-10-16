@@ -1,8 +1,10 @@
 import Foundation
+import SwitcherCore
 
 final class Preferences {
-    private let defaults = UserDefaults.standard
-    init() {
+    private let defaults: UserDefaults
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         defaults.register(defaults: ["rememberWindows": true, "includeMinimized": true, "showPreviews": false,
                                      "allSpaces": true, "showHints": true])
     }
@@ -25,5 +27,17 @@ final class Preferences {
     var showHints: Bool {
         get { defaults.bool(forKey: "showHints") }
         set { defaults.set(newValue, forKey: "showHints") }
+    }
+    var shortcuts: ShortcutConfiguration {
+        get {
+            guard let data = defaults.data(forKey: "shortcuts"),
+                  let value = try? JSONDecoder().decode(ShortcutConfiguration.self, from: data) else {
+                return ShortcutConfiguration()
+            }
+            return value
+        }
+        set {
+            if let data = try? JSONEncoder().encode(newValue) { defaults.set(data, forKey: "shortcuts") }
+        }
     }
 }

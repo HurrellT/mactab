@@ -8,6 +8,9 @@ final class SwitcherController {
     let keyboard = KeyboardInterceptor()
     let panel = SwitcherPanel()
     private let previews = PreviewService()
+    private lazy var directShortcuts = DirectShortcutController(preferences: preferences, windows: windowService)
+    private var focusCancellation: ActionCancellation?
+    private let presentationDelay: TimeInterval = 0.10
     private(set) var selection = Selection()
     private var apps: [ApplicationItem] = []
     private var windows: [WindowItem] = []
@@ -25,14 +28,26 @@ final class SwitcherController {
     }
     private var pendingCommit: PendingCommit?
     var onFocusFailure: (() -> Void)?
+    var onShortcutError: ((String) -> Void)?
 
     init(preferences: Preferences) {
         self.preferences = preferences
         keyboard.isSwitching = { [weak self] in self?.selection.isActive ?? false }
         keyboard.onKey = { [weak self] in self?.handle($0) }
         keyboard.onInterruption = { [weak self] in self?.cancel() }
+        keyboard.onShortcut = { [weak self] binding in
+            guard let self else { return }
+            focusCancellation?.cancel()
+            dismiss(clearPending: true)
+            directShortcuts.perform(binding)
+        }
+        directShortcuts.onError = { [weak self] in self?.onShortcutError?($0) }
+        keyboard.bindings = preferences.shortcuts.activeBindings
         catalog.onActivation = { [weak self] pid in self?.windowService.observeFrontmost(pid) }
-        catalog.onTermination = { [weak self] pid in self?.windowService.forget(pid) }
+        catalog.onTermination = { [weak self] pid in
+            self?.windowService.forget(pid)
+            self?.directShortcuts.forget(pid)
+        }
         panel.onAppClick = { [weak self] index in
             guard let self else { return }
             selection.selectApp(index)
@@ -46,6 +61,7 @@ final class SwitcherController {
             commit()
         }
         panel.onVisibleWindowsChanged = { [weak self] in self?.refreshPreviews() }
+        panel.onPresentation = { [weak self] in self?.refreshPreviews() }
     }
 
     func start() -> Bool {
@@ -57,6 +73,8 @@ final class SwitcherController {
     }
 
     func handle(_ key: SwitcherKey) {
+        directShortcuts.cancel()
+        focusCancellation?.cancel()
         switch key {
         case .tab(let backwards):
             if selection.isWindowOnly { cancel() }
@@ -66,7 +84,7 @@ final class SwitcherController {
                 selection.begin(appCount: apps.count, backwards: backwards)
                 guard selection.isActive else { return }
                 panel.showHints = preferences.showHints
-                panel.show(apps: apps, selected: selection.appIndex)
+                panel.show(apps: apps, selected: selection.appIndex, presentationDelay: presentationDelay)
             } else {
                 selection.moveApp(backwards ? -1 : 1)
                 invalidateWindows()
@@ -103,7 +121,7 @@ final class SwitcherController {
         apps = [ApplicationItem(application: app, icon: app.icon ?? NSImage(named: NSImage.applicationIconName)!)]
         selection.beginWindows()
         panel.showHints = preferences.showHints
-        panel.show(apps: apps, selected: 0, windowsOnly: true)
+        panel.show(apps: apps, selected: 0, windowsOnly: true, presentationDelay: presentationDelay)
         pendingWindowSteps = backwards ? -1 : 1
         expand()
     }
@@ -177,7 +195,7 @@ final class SwitcherController {
 
     private func refreshPreviews() {
         // A cached pass must not capture the same previews twice. Wait for fresh metadata.
-        guard preferences.showPreviews, selection.isExpanded, !loading, !refreshingWindows else { return }
+        guard panel.isVisible, preferences.showPreviews, selection.isExpanded, !loading, !refreshingWindows else { return }
         let indices = panel.visibleWindowIndices()
         guard indices != visiblePreviews else { return }
         visiblePreviews = indices
@@ -226,13 +244,23 @@ final class SwitcherController {
     }
 
     private func activate(_ window: WindowItem?, application app: NSRunningApplication, remember: Bool) {
-        windowService.focus(window, application: app, remember: remember) { [weak self] success in
+        let cancellation = ActionCancellation()
+        focusCancellation = cancellation
+        windowService.focus(window, application: app, remember: remember, cancellation: cancellation) { [weak self] success in
+            guard !cancellation.isCancelled else { return }
             if !success { self?.onFocusFailure?() }
         }
     }
 
     func cancel() {
+        directShortcuts.cancel()
+        focusCancellation?.cancel()
         dismiss(clearPending: true)
+    }
+
+    func refreshShortcuts() {
+        cancel()
+        keyboard.bindings = preferences.shortcuts.activeBindings
     }
 
     private func dismiss(clearPending: Bool) {

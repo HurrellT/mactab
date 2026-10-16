@@ -14,6 +14,7 @@ final class SettingsWindow: NSWindowController {
     var onRefresh: ((Bool) -> PermissionReport?)?
     var onRelaunch: (() -> Void)?
     var onPreferencesChanged: (() -> Void)?
+    var onOpenShortcuts: (() -> Void)?
 
     init(preferences: Preferences) {
         self.preferences = preferences
@@ -80,9 +81,12 @@ final class SettingsWindow: NSWindowController {
         relaunch.frame = NSRect(x: 389, y: 79, width: 122, height: 32)
         content.addSubview(relaunch)
         let footnote = label("Runs in the menu bar. No background window scanning or recording.", size: 11, color: .secondaryLabelColor)
-        footnote.frame = NSRect(x: 32, y: 29, width: 476, height: 30)
+        footnote.frame = NSRect(x: 166, y: 29, width: 342, height: 30)
         footnote.maximumNumberOfLines = 2
         content.addSubview(footnote)
+        let shortcuts = NSButton(title: "Shortcuts…", target: self, action: #selector(openShortcuts))
+        shortcuts.frame = NSRect(x: 28, y: 27, width: 125, height: 32)
+        content.addSubview(shortcuts)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -196,6 +200,7 @@ final class SettingsWindow: NSWindowController {
     }
 
     @objc private func relaunchApp() { onRelaunch?() }
+    @objc private func openShortcuts() { onOpenShortcuts?() }
 
     private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
         let label = NSTextField(labelWithString: text)

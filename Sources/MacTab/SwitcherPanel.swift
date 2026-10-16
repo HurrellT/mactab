@@ -117,6 +117,8 @@ final class SwitcherPanel: NSPanel {
     private var windowTiles: [TileButton] = []
     private var screenFrame = NSRect.zero
     private var scrollObserver: NSObjectProtocol?
+    private var pendingPresentation: DispatchWorkItem?
+    private var presentationGeneration = 0
     private var windowsOnly = false
     private var appTileWidth: CGFloat = 120
     private var appTileHeight: CGFloat { appTileWidth * 112 / 120 + 28 }
@@ -128,6 +130,7 @@ final class SwitcherPanel: NSPanel {
     var onAppClick: ((Int) -> Void)?
     var onWindowClick: ((Int) -> Void)?
     var onVisibleWindowsChanged: (() -> Void)?
+    var onPresentation: (() -> Void)?
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
@@ -188,7 +191,9 @@ final class SwitcherPanel: NSPanel {
         }
     }
 
-    func show(apps: [ApplicationItem], selected: Int, windowsOnly: Bool = false) {
+    func show(apps: [ApplicationItem], selected: Int, windowsOnly: Bool = false,
+              presentationDelay: TimeInterval = 0) {
+        cancelPresentation()
         self.windowsOnly = windowsOnly
         let point = NSEvent.mouseLocation
         screenFrame = (NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main ?? NSScreen.screens[0]).visibleFrame
@@ -209,7 +214,29 @@ final class SwitcherPanel: NSPanel {
         if !windowsOnly { collapse() }
         else { layoutContents() }
         updateAppSelection(selected)
+        if presentationDelay > 0 {
+            let token = presentationGeneration
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, presentationGeneration == token else { return }
+                pendingPresentation = nil
+                present()
+            }
+            pendingPresentation = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + presentationDelay, execute: work)
+        } else {
+            present()
+        }
+    }
+
+    private func present() {
         orderFrontRegardless()
+        onPresentation?()
+    }
+
+    private func cancelPresentation() {
+        presentationGeneration += 1
+        pendingPresentation?.cancel()
+        pendingPresentation = nil
     }
 
     private func row(_ tiles: [TileButton], tileWidth: CGFloat, height: CGFloat) -> NSView {
@@ -269,6 +296,7 @@ final class SwitcherPanel: NSPanel {
         windowHeading.stringValue = headingText + (message.map { " · " + $0 } ?? "")
     }
     func dismiss() {
+        cancelPresentation()
         orderOut(nil)
         appTiles.removeAll()
         windowTiles.removeAll()

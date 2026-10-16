@@ -53,10 +53,11 @@ private struct ServerWindow {
 }
 
 /// All cross-process work runs off the event tap/main thread. Nothing polls while idle.
-final class WindowService {
+final class WindowService: ShortcutWindowServicing {
     private let queue = DispatchQueue(label: "com.mactab.accessibility", qos: .userInitiated)
     private let crossSpace = CrossSpaceAccessibility()
     private var remembered: [pid_t: AXUIElement] = [:]
+    private var focusHistory: [pid_t: WindowFocusHistory<WindowIdentity>] = [:]
     private var cached: [pid_t: [CGWindowID: AXUIElement]] = [:]
     private var snapshots = WindowSnapshotCache<WindowSnapshotKey, WindowItem>()
     private var recoveryAttempt: (pid: pid_t, ids: Set<CGWindowID>, time: Double)?
@@ -112,7 +113,7 @@ final class WindowService {
             var elements = includeWindows ? Self.attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? [] : []
             if let value = Self.attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() {
                 let focused = value as! AXUIElement
-                remembered[pid] = focused
+                rememberFocus(focused, pid: pid)
                 elements.append(focused)
             }
             for element in elements {
@@ -121,9 +122,17 @@ final class WindowService {
         }
     }
 
+    // Called only on the accessibility queue, including focus changes outside MacTab.
+    private func rememberFocus(_ element: AXUIElement, pid: pid_t) {
+        remembered[pid] = element
+        let identity = crossSpace.windowID(element).map(WindowIdentity.server) ?? .accessibility(element)
+        focusHistory[pid, default: WindowFocusHistory()].record(identity)
+    }
+
     func forget(_ pid: pid_t) {
         queue.async { [self] in
             remembered.removeValue(forKey: pid)
+            focusHistory.removeValue(forKey: pid)
             cached.removeValue(forKey: pid)
             crossSpace.forget(pid)
             if snapshots.key?.pid == pid { snapshots.clear() }
@@ -196,9 +205,21 @@ final class WindowService {
             var previous = remember ? remembered[pid] : nil
             if startingAtFocusedWindow,
                let value = Self.attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() {
-                previous = (value as! AXUIElement)
+                let focused = value as! AXUIElement
+                previous = focused
+                rememberFocus(focused, pid: pid)
             }
             let previousID = previous.flatMap { crossSpace.windowID($0) }
+            let focusedIdentity = previous.map { element in
+                previousID.map(WindowIdentity.server) ?? .accessibility(element)
+            }
+            // Capture one order for both cached cards and fresh discovery. Quick release
+            // and holding the overlay must choose the same previously viewed window.
+            let history = focusHistory[pid] ?? WindowFocusHistory()
+            func ordered(_ items: [WindowItem]) -> [WindowItem] {
+                guard remember, startingAtFocusedWindow else { return items }
+                return history.ordered(items, identity: \.identity, focused: focusedIdentity)
+            }
             func preferredIndex(_ items: [WindowItem]) -> Int? {
                 items.firstIndex { item in
                     if let element = item.element, let previous, CFEqual(element, previous) { return true }
@@ -207,7 +228,7 @@ final class WindowService {
             }
             var cacheHit = false
             if let snapshot = snapshots.value(for: key, now: started) {
-                let cards = snapshot.compactMap { original -> WindowItem? in
+                let cards = ordered(snapshot.compactMap { original -> WindowItem? in
                     let isPublished = original.windowID.map { publishedIDs.contains($0) } ??
                         original.element.map { element in published.contains { CFEqual($0, element) } } ?? false
                     let server = original.windowID.flatMap { byID[$0] }
@@ -219,7 +240,7 @@ final class WindowService {
                     var card = original
                     card.isOnCurrentSpace = isPublished || (server?.onScreen ?? false)
                     return card
-                }
+                })
                 let preferred = preferredIndex(cards)
                 // Newly focused windows need full discovery before cycling from them.
                 let knownMinimizedState = includeMinimized || !publishedWindows.contains { $0.id == nil }
@@ -299,6 +320,14 @@ final class WindowService {
                                              isOnCurrentSpace: server.onScreen))
                 }
             }
+            result = ordered(result)
+            if allSpaces {
+                // Prune closed windows, retaining history for windows hidden by preferences.
+                let live = inventory.map { WindowIdentity.server($0.id) } + publishedWindows.map { element, id in
+                    id.map(WindowIdentity.server) ?? .accessibility(element)
+                }
+                focusHistory[pid]?.retain(live)
+            }
             let preferred = preferredIndex(result) ?? 0
             snapshots.store(result, for: key, now: Self.uptime)
             if timings {
@@ -375,10 +404,11 @@ final class WindowService {
     }
 
     func focus(_ requestedWindow: WindowItem?, application app: NSRunningApplication, remember: Bool,
+               cancellation: ActionCancellation? = nil,
                completion: @escaping (Bool) -> Void) {
         let pid = app.processIdentifier
         queue.async { [self] in
-            guard !app.isTerminated else { DispatchQueue.main.async { completion(false) }; return }
+            guard !app.isTerminated, cancellation?.isCancelled != true else { DispatchQueue.main.async { completion(false) }; return }
             var window = requestedWindow
             // Discovery queued before this activation may have refreshed a cached card.
             if let key = snapshots.key, key.pid == pid,
@@ -404,15 +434,17 @@ final class WindowService {
                 target = cached[pid]?[id] ?? crossSpace.recover(pid: pid, ids: [id])[id]
             }
             if let target {
+                guard cancellation?.isCancelled != true else { DispatchQueue.main.async { completion(false) }; return }
                 AXUIElementSetMessagingTimeout(target, 0.15)
                 AXUIElementSetAttributeValue(target, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
             }
             let resolvedTarget = target
             let resolvedWindow = window
             DispatchQueue.main.async {
-                guard !app.isTerminated else { completion(false); return }
+                guard !app.isTerminated, cancellation?.isCancelled != true else { completion(false); return }
                 app.activate(options: [])
                 self.queue.async {
+                    guard cancellation?.isCancelled != true else { DispatchQueue.main.async { completion(false) }; return }
                     var raised = resolvedWindow == nil
                     if let target = resolvedTarget {
                         let root = self.application(pid)
@@ -420,7 +452,7 @@ final class WindowService {
                         AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
                         raised = AXUIElementPerformAction(target, kAXRaiseAction as CFString) == .success
                         if raised {
-                            self.remembered[pid] = target
+                            self.rememberFocus(target, pid: pid)
                             if let id = self.crossSpace.windowID(target) { self.cached[pid, default: [:]][id] = target }
                         } else { self.remembered.removeValue(forKey: pid) }
                     }

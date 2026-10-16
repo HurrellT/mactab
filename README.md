@@ -24,7 +24,7 @@ If Accessibility is granted but the keyboard hook fails, the check explains whet
 
 To keep grants across code changes, follow the [stable signing setup](docs/SIGNING.md) for a local certificate or an Apple-issued identity. Save its name or fingerprint in `.signing-identity`, or supply `MACTAB_SIGN_IDENTITY` when building. Changing the identifier or weakening the signing requirement is not a substitute. Screen Recording grants can also become stale after an ad-hoc rebuild; **Check permissions** checks that grant separately.
 
-The app lives in the menu bar. Use its menu to open Settings, disable it, or quit. To run at login, add the built app under System Settings → General → Login Items. Keep the app at a stable path; if you move it, update its permission entry.
+The app lives in the menu bar. Its application icon uses the same overlapping-window symbol as the menu bar. Use its menu to open Settings, disable it, or quit. To run at login, add the built app under System Settings → General → Login Items. Keep the app at a stable path; if you move it, update its permission entry.
 
 ## Free prebuilt sharing
 
@@ -45,7 +45,9 @@ Run `./scripts/build.sh --universal` and `./scripts/package.sh` to create a ZIP 
 | Escape | Cancel |
 | Click an app or window | Activate it |
 
-The grave shortcut uses the physical key above Tab (key code 50), as on a US keyboard. Hold Command to keep either switcher open. The standalone window switcher advances to the next window on its first press, relative to the actual focused window, independently of the remembering preference. Shift reverses this initial step. Repeated grave presses or arrows cycle windows; releasing Command activates the selection. Command + Tab from this mode starts the usual app switcher. Up collapses windows only in the app switcher.
+The grave shortcut uses the physical key above Tab (key code 50), as on a US keyboard. Hold Command to keep either switcher open. With **Remember the last focused window** enabled, the standalone window switcher orders visited windows by recent focus: its first press selects the previously viewed window, including one on another Space when **Show windows from all Spaces** is enabled. Quick taps toggle between the two most recently focused windows; holding Command keeps that session's order stable for cycling through the remaining windows. With remembering off, the first press advances from the actual focused window in the app's enumeration order. Shift reverses this initial step. Repeated grave presses or arrows cycle windows; releasing Command activates the selection. Command + Tab from this mode starts the usual app switcher. Up collapses windows only in the app switcher.
+
+Both switchers wait 100 ms before appearing, so quick taps activate the selection without flashing the overlay. Selection and window discovery start immediately; only presentation is delayed. Thumbnail capture starts once the overlay is visible. The delay uses a cancellable, one-shot callback with no idle polling.
 
 ## Preferences
 
@@ -54,6 +56,22 @@ The grave shortcut uses the physical key above Tab (key code 50), as on a US key
 - **Show windows from all Spaces** (on): combine the WindowServer inventory with Accessibility windows, including other Spaces and fullscreen windows. Turn it off to retain the original current-Spaces list, including covered and minimized windows exposed by the app. Other-Space windows are identified on their cards.
 - **Show keyboard hints in the switcher** (on): turn it off to hide the shortcut footer in both rows and shrink the overlay. Keyboard controls continue to work.
 - **Window thumbnails** (off): optional Screen Recording permission. Only visible window cards receive small, on-demand still images. New previews use a 120 ms native [Core Animation crossfade](https://developer.apple.com/documentation/quartzcore/catransition), disabled with Reduce Motion. Scrolling retains overlapping visible previews and captures only missing images, keeping the six-image limit. No capture stream, background recording, or disk storage. Without permission, cards show the app icon, window title, and display instead.
+
+## Liquid Glass appearance
+
+MacTab supports the system Liquid Glass appearance settings on **macOS 27** through AppKit's native glass surface. Adjust the Liquid Glass slider under **System Settings → Appearance** to choose the amount of transparency and tinting. There is no separate glass preference in MacTab. The overlay keeps its dark appearance for contrast over light windows; the system glass setting controls its material treatment. See Apple's [Appearance settings](https://support.apple.com/guide/mac-help/change-appearance-settings-mchlp1225/27/mac/27) and [Liquid Glass accessibility guidance](https://developer.apple.com/documentation/technologyoverviews/adopting-liquid-glass).
+
+Native Liquid Glass is also used on macOS 26. macOS 14 and 15 use the older visual-effect material.
+
+## Direct application shortcuts
+
+Open **Settings → Shortcuts…** to add, edit, enable, or remove an application shortcut. No bindings are installed by default. Record a chord containing Command, Control, or Option; Escape cancels recording. Bindings use physical keys, like the main switcher. Duplicate chords and the existing Command-Tab/Command-grave shortcuts are rejected. Other applications and macOS can still reserve conflicting shortcuts.
+
+Choose an application bundle. From another app, the shortcut activates it and honors **Remember the last focused window**. While the target app is active, each press advances to its next window, wrapping around. Window cycling follows the minimized-window and all-Spaces preferences and keeps a stable order even when the app reorders its windows after activation. **Launch if closed** is on by default and can be disabled for each binding. Held-key repeats do not cycle; separate rapid presses are queued. Direct shortcuts do not open the overlay or load thumbnails.
+
+These bindings share the existing keyboard hook, are suspended while recording a shortcut, and stop when MacTab is disabled. Window discovery happens only when cycling; there is no idle polling, second keyboard hook, or screenshot preloading. Older saved desktop mappings are ignored while application bindings are retained. Configure desktop shortcuts directly in **System Settings → Keyboard → Keyboard Shortcuts → Mission Control**.
+
+Space animations continue to use macOS's system behavior. An option to skip animations when focusing an app or window on another Space remains **deferred**; see the [implementation notes and future animation plan](docs/SHORTCUTS_PLAN.md).
 
 ## Architecture and performance
 
@@ -85,6 +103,8 @@ A read-only Chrome discovery benchmark on 2026-10-07 compared the previous servi
 ```sh
 swift test
 swift build
+# Regenerate the bundled app icon from the menu bar SF Symbol (only when changing the asset):
+swift scripts/generate-app-icon.swift
 # Print permission and keyboard-hook state for a terminal-launched process:
 build/MacTab.app/Contents/MacOS/MacTab --diagnostics
 # Always show Settings (including when already authorized):

@@ -8,6 +8,7 @@ let package = Package(
     targets: [
         .target(name: "SwitcherCore"),
         .executableTarget(name: "MacTab", dependencies: ["SwitcherCore"]),
-        .testTarget(name: "SwitcherCoreTests", dependencies: ["SwitcherCore"])
+        .testTarget(name: "SwitcherCoreTests", dependencies: ["SwitcherCore"]),
+        .testTarget(name: "MacTabTests", dependencies: ["MacTab"])
     ]
 )

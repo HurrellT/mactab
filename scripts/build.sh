@@ -20,6 +20,7 @@ bundle_path="$PWD/build/MacTab.app"
 mkdir -p "$bundle_path/Contents/MacOS" "$bundle_path/Contents/Resources"
 cp "$binary_dir/MacTab" "$bundle_path/Contents/MacOS/MacTab"
 cp Resources/Info.plist "$bundle_path/Contents/Info.plist"
+cp Resources/AppIcon.icns "$bundle_path/Contents/Resources/AppIcon.icns"
 # Use the same certificate and identifier for every rebuild to preserve TCC identity.
 codesign --force --sign "$signing_identity" --identifier com.tlh.mactab "$bundle_path"
 codesign --verify --strict "$bundle_path"
