@@ -1,6 +1,6 @@
 # MacTab
 
-A small native macOS app switcher with an optional window row. Built with Swift and AppKit, with no third-party dependencies. Requires macOS 14 or later.
+A small native macOS app switcher with an optional window row. Built with Swift and AppKit, with no third-party dependencies. Focused on maximum performance. Requires macOS 14 or later.
 
 ## Build and run
 
